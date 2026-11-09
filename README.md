@@ -524,6 +524,3 @@ export GCP_PROJECT=<your-gcp-project-id>
 
 This project is licensed under the [MIT License](LICENSE).
 
-## Author
-
-**Adityo Nugroho** ([@adityonugrohoid](https://github.com/adityonugrohoid))
