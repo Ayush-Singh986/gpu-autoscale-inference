@@ -518,4 +518,4 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## Author
 
-**Ayush Singh** ([@Ayush-Singh986](https://github.com/Ayush-Singh986))
+**Adityo Nugroho** ([@adityonugrohoid](https://github.com/adityonugrohoid))
