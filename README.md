@@ -516,6 +516,3 @@ This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-## Author
-
-**Adityo Nugroho** ([@adityonugrohoid](https://github.com/adityonugrohoid))
