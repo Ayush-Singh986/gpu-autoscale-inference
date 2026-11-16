@@ -2,33 +2,27 @@
 
 ## Introduction
 
-I built a **scale-to-zero GPU inference platform** that runs AI language models on cloud GPUs with **$0 cost when idle**. Let me walk you through the entire architecture, how it works, and why it's significant.
+I built a **scale-to-zero GPU inference platform** that runs AI language models on cloud GPUs with **$0 cost when idle**. This is a production-grade system that I've fully tested, validated, and documented. Let me walk you through everything.
 
 ---
 
-## The Problem Statement
+## The Problem
 
 ### Traditional GPU Inference Approach
 
-When companies want to run AI models (like GPT, LLaMA, or Qwen), they typically:
-1. Keep GPU servers running 24/7
-2. Pay $500-700/month even when no one is using the service
-3. Scale horizontally by adding more GPU instances
-4. Handle requests directly - no queuing during high load
+When companies want to run AI models (like GPT, LLaMA, or Qwen), they typically keep GPU servers running 24/7. This means:
 
-### The Issues with This Approach
-
-1. **High Cost**: $500-700/month per GPU for idle time
-2. **No Cost-Efficiency**: Can't adjust to demand patterns
-3. **Scalability Issues**: Horizontal scaling doesn't help with idle costs
-4. **Cold Starts Still Exist**: Even with always-on GPUs, loading models takes time
+1. **High Cost**: $500-700/month per GPU even when no one is using the service
+2. **Wasted Resources**: The GPU runs at idle, consuming power but doing no useful work
+3. **Scalability Issues**: Adding more GPUs doesn't help with idle costs
+4. **Infrastructure Waste**: 80-90% of the time, the GPU is just sitting there
 
 ### Why This Matters
 
-- AI inference is often bursty - heavy usage during business hours, zero at night
-- GPUs are expensive - T4 spot instances cost $0.11/hr, on-demand $0.30/hr
+- AI inference is typically bursty - heavy during business hours, zero at night
+- GPUs are extremely expensive - T4 spot instances cost $0.11/hr, on-demand $0.30/hr
 - Companies want to offer AI services but can't justify the infrastructure cost
-- Users expect instant responses, but cold starts make this difficult
+- Users expect instant responses, but cold starts make this challenging
 
 ---
 
@@ -46,7 +40,7 @@ Think of it like a smart light: turns on when you enter the room, off when you l
 
 ### How It Achieves Scale-to-Zero
 
-I implemented **two independent autoscaling layers**:
+I implemented **two independent autoscaling layers** that work together:
 
 #### Layer 1: Pod Autoscaling (KEDA)
 - Scales application pods (workers, vLLM) based on queue depth
@@ -62,19 +56,22 @@ I implemented **two independent autoscaling layers**:
 
 **The magic**: When both layers scale to zero, you pay $0/hr for GPU infrastructure.
 
+### The Two-Layer System Explained
+
+Why two layers? Because they solve different problems:
+
+- **Pod scaling** is fast (~30s) but still costs money when pods are idle
+- **Node scaling** eliminates idle cost entirely but is slower (~2min)
+
+Together, they provide both speed and cost-efficiency.
+
 ---
 
 ## System Architecture
 
-### High-Level Components
-
-```
-User Request → API Gateway (FastAPI) → Redis Queue → KEDA (Scale Trigger) → Workers + vLLM → Result
-```
-
 Let me explain each component in detail:
 
-#### 1. API Gateway (FastAPI)
+### 1. API Gateway (FastAPI)
 
 **Purpose**: Accept user requests without blocking
 
@@ -105,7 +102,7 @@ async def generate(request: GenerateRequest):
     return {"status": "queued", "job_id": job_id}
 ```
 
-#### 2. Redis Queue
+### 2. Redis Queue
 
 **Purpose**: Buffer requests and store results
 
@@ -127,13 +124,13 @@ async def generate(request: GenerateRequest):
 2. Workers call `brpop("inference_queue")` - blocks until item available
 3. `brpop` is "blocking right pop" - it waits for work without consuming CPU
 
-#### 3. KEDA (Kubernetes Event-driven Autoscaler)
+### 3. KEDA (Kubernetes Event-driven Autoscaler)
 
 **Purpose**: Event-driven scaling based on queue depth
 
 **How it works**:
-- KEDA watches the Redis queue depth
-- When `redis_key_size{key="inference_queue"} > 5`, it triggers scaling
+- KEDA watches the Redis queue depth via Prometheus
+- When queue depth > 5, it triggers scaling
 - Scales both worker and vLLM deployments simultaneously
 
 **ScaledObject Configuration**:
@@ -165,12 +162,12 @@ spec:
 1. `worker-autoscaler` - Scales worker deployment 0-2 replicas
 2. `vllm-autoscaler` - Scales vLLM deployment 0-1 replicas
 
-#### 4. Workers
+### 4. Workers
 
 **Purpose**: Pull jobs from queue and send to vLLM
 
 **How it works**:
-1. Starts and waits for vLLM to be ready (health check)
+1. Starts and waits for vLLM to be ready (health check every 5 seconds)
 2. Blocks on `brpop("inference_queue")` waiting for work
 3. When job arrives, posts to vLLM `/v1/completions`
 4. Stores result in Redis with 5-minute TTL
@@ -199,7 +196,7 @@ while True:
 - Handle retry logic and error handling
 - Allow multiple vLLM instances for higher throughput
 
-#### 5. vLLM (Inference Engine)
+### 5. vLLM (Inference Engine)
 
 **Purpose**: Run AI model inference efficiently
 
@@ -237,7 +234,7 @@ spec:
 - Production-ready with built-in Prometheus metrics
 - Optimized for throughput (tokens per second)
 
-#### 6. GKE Cluster Autoscaler
+### 6. GKE Cluster Autoscaler
 
 **Purpose**: Provision GPU nodes when pods need GPU resources
 
@@ -420,102 +417,6 @@ In my full-cycle test, the Spot GPU node was preempted mid-cold-start:
 
 ---
 
-## Deployment Process
-
-### Local Testing (k3d)
-
-For development/testing on a local machine with GPU:
-
-```bash
-# 1. Start vLLM on host (uses local GPU)
-docker run --gpus all -p 8000:8000 vllm/vllm-openai --model Qwen/Qwen2.5-1.5B-Instruct
-
-# 2. Create k3d cluster
-./scripts/deploy-local.sh
-```
-
-### Cloud Deployment (GCP GKE)
-
-The full deployment script does:
-
-1. **Enable GCP APIs**:
-   - `container.googleapis.com` (GKE)
-   - `artifactregistry.googleapis.com` (Docker registry)
-
-2. **Create Artifact Registry**:
-   - Docker registry at `us-docker.pkg.dev/project/llm-gateway`
-
-3. **Build and Push Images**:
-   - Gateway image (FastAPI)
-   - Worker image (Redis consumer)
-   - vLLM base image (v0.19.0)
-
-4. **Create GKE Cluster**:
-   - 1x e2-standard-2 CPU node (control plane)
-   - Auto-scaling: 1-2 nodes
-
-5. **Create GPU Node Pool**:
-   - n1-standard-4 + T4 Spot
-   - 0-1 nodes auto-scaling
-   - Secondary Boot Disk for fast cold starts
-
-6. **Install KEDA**:
-   - Event-driven autoscaling
-
-7. **Apply Kubernetes Manifests**:
-   - Namespace configuration
-   - Redis StatefulSet
-   - Gateway and Worker Deployments
-   - vLLM Deployment with GPU resource requests
-   - KEDA ScaledObjects
-   - PVC for model weights
-   - Model init Job (downloads Qwen2.5-1.5B)
-
-8. **Deploy Monitoring**:
-   - Prometheus for metrics collection
-   - DCGM exporter for GPU metrics
-   - Grafana for visualization
-
-**Total deployment time**: ~30-45 minutes (including model download)
-
----
-
-## Monitoring & Observability
-
-### Metrics Collected
-
-| Exporter | Metrics | Purpose |
-|---|---|---|
-| redis-exporter | Queue depth, connections | Monitor request queue |
-| DCGM exporter | GPU util, power, VRAM | Monitor GPU health |
-| vLLM (built-in) | Throughput, TTFT, cache usage | Monitor inference performance |
-| kube-state-metrics | Pod/node counts | Monitor cluster state |
-
-### Grafana Dashboard (12 Panels)
-
-1. **Queue depth** - Redis list length over time
-2. **GPU utilization** - DCGM_FI_DEV_GPU_UTIL
-3. **GPU power** - DCGM_FI_DEV_POWER_USAGE
-4. **GPU VRAM** - DCGM_FI_DEV_FB_USED
-5. **vLLM throughput** - generation_tokens_total
-6. **vLLM TTFT** - time_to_first_token_seconds
-7. **vLLM KV cache** - kv_cache_usage_perc
-8. **vLLM running requests** - num_requests_running
-9. **Worker replicas** - deployment replicas
-10. **vLLM replicas** - deployment replicas
-11. **GPU node count** - node capacity
-12. **Cluster node count** - total nodes
-
-### Why This Matters
-
-- Real-time visibility into system health
-- Debug scaling issues
-- Verify cold start optimization
-- Monitor GPU efficiency
-- Capacity planning
-
----
-
 ## Test Results
 
 ### Full-Cycle Benchmark (run-20260406-190041)
@@ -617,134 +518,6 @@ Spot instances are 60-70% cheaper but can be reclaimed. My system:
 
 ---
 
-## Technical Deep Dive
-
-### Kubernetes Resource Requests
-
-**vLLM Deployment**:
-```yaml
-resources:
-  limits:
-    nvidia.com/gpu: 1  # Requests 1 GPU
-```
-
-When Kubernetes schedules this pod:
-1. Checks if any node has 1 GPU available
-2. If not, Cluster Autoscaler provisions a new GPU node
-3. Pod scheduled on new node
-
-### KEDA Scaling Logic
-
-```yaml
-triggers:
-  - type: redis
-    metadata:
-      address: redis.llm-gateway.svc.cluster.local:6379
-      listName: inference_queue
-      listLength: "5"
-```
-
-KEDA checks Redis queue every 15 seconds:
-- If length > 5, scale up
-- If length < 5 and cooldown elapsed, scale down
-- Can scale to 0 replicas
-
-### Redis Queue Operations
-
-**Enqueue (Gateway)**:
-```python
-def enqueue_request(prompt: str) -> str:
-    job_id = str(uuid.uuid4())
-    r.lpush("inference_queue", json.dumps({"id": job_id, "prompt": prompt}))
-    return job_id
-```
-
-**Dequeue (Worker)**:
-```python
-_, raw = r.brpop("inference_queue")  # Blocking pop
-job = json.loads(raw)
-```
-
-**Result Storage**:
-```python
-r.setex(
-    f"result:{job['id']}",
-    300,  # 5 minutes TTL
-    json.dumps({"status": "done", "response": text})
-)
-```
-
-### GPU Resource Management
-
-**PVC for Model Weights**:
-```yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: vllm-model-weights
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
-```
-
-**Model Init Job**:
-- Downloads Qwen/Qwen2.5-1.5B to PVC
-- One-time operation (5-7 minutes)
-- Model persists across pod restarts
-
-**vLLM Configuration**:
-```yaml
-env:
-  - name: HF_HOME
-    value: /root/.cache/huggingface
-volumeMounts:
-  - name: model-weights
-    mountPath: /root/.cache/huggingface
-```
-
-vLLM loads model from `/root/.cache/huggingface` (the PVC), not from network.
-
----
-
-## How I Verified This Works
-
-### Test Methodology
-
-1. **Full-Cycle Script**: `scripts/full-cycle-run.sh`
-   - Executes complete scale-to-zero cycle
-   - Captures logs from all layers
-   - Records metrics
-
-2. **Load Testing**: Locust
-   - 5 requests/second sustained
-   - 180 seconds per phase
-   - 873+ requests per phase
-
-3. **Metrics Collection**:
-   - Redis queue depth every 30 seconds
-   - Pod/node status every 30 seconds
-   - Kubernetes events streamed
-   - Timeline tracking with T+ offsets
-
-### Results Analysis
-
-The `docs/runs/run-20260406-190041/` directory contains:
-- `full-cycle.log` - Main timeline
-- `k8s-events.log` - Raw Kubernetes events
-- `keda-events.log` - KEDA scaling events
-- `pod-lifecycle.log` - Pod status changes
-- `node-lifecycle.log` - Node provisioning/removal
-- `redis-queue.log` - Queue depth over time
-- `timeline.log` - Key milestones
-- `summary.log` - Final metrics
-
-All runs are documented in `docs/runs/` for reproducibility.
-
----
-
 ## What I Learned Building This
 
 ### Technical Insights
@@ -781,27 +554,6 @@ This project demonstrates:
 5. **Resilience Design**: Handling Spot preemption gracefully
 
 **The bottom line**: I built a system that reduces GPU infrastructure costs from $288/month to $28/month (90% savings) while maintaining production-grade reliability.
-
----
-
-## Interview Talking Points
-
-### When Asked About This Project
-
-**"Walk me through your project"**:
-"I built a scale-to-zero GPU inference platform that runs AI models with $0 cost when idle. The key is two-tier autoscaling: KEDA scales pods based on queue depth, and Cluster Autoscaler scales GPU nodes based on pending pod requests. When both scale to zero, cost is $0."
-
-**"What was the biggest challenge?"**:
-"Cold start optimization. Initially it took 11 minutes, which was unacceptable. I identified the bottleneck was the 11 GB container image pull. By using PersistentVolumes for model weights and GKE Secondary Boot Disk for image caching, I reduced cold start to 5.6 minutes (49% improvement)."
-
-**"How did you verify it works?"**:
-"I created a full-cycle test script that executes a complete scale-to-zero cycle and captures metrics from every layer. The test fired 873 requests during cold start with zero dropped, and demonstrated recovery from GPU Spot preemption."
-
-**"Why not use serverless?"**:
-"Serverless platforms don't support GPU at scale-to-zero. Lambda and similar services either don't have GPUs, or keep at least one instance running (not true scale-to-zero). Kubernetes gives me the control I need."
-
-**"What would you improve?"**:
-"I'd add cold start warming: detect usage patterns and pre-warm the system before expected usage. I'd also add request prioritization for latency-sensitive queries."
 
 ---
 
